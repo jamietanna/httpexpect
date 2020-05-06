@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
 func createBasicHandler() http.Handler {
@@ -160,18 +158,6 @@ func TestE2EBasicBinderStandard(t *testing.T) {
 		Reporter: NewAssertReporter(t),
 		Client: &http.Client{
 			Transport: NewBinder(handler),
-		},
-	}))
-}
-
-func TestE2EBasicBinderFast(t *testing.T) {
-	handler := fasthttpadaptor.NewFastHTTPHandler(createBasicHandler())
-
-	testBasicHandler(WithConfig(Config{
-		BaseURL:  "http://example.com",
-		Reporter: NewAssertReporter(t),
-		Client: &http.Client{
-			Transport: NewFastBinder(handler),
 		},
 	}))
 }

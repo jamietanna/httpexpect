@@ -5,8 +5,6 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
 func createCookieHandler() http.Handler {
@@ -108,36 +106,6 @@ func TestE2ECookieBinderStandardEnabled(t *testing.T) {
 		Reporter: NewAssertReporter(t),
 		Client: &http.Client{
 			Transport: NewBinder(handler),
-			Jar:       NewJar(),
-		},
-	})
-
-	testCookieHandler(e, true)
-}
-
-func TestE2ECookieBinderFastDisabled(t *testing.T) {
-	handler := fasthttpadaptor.NewFastHTTPHandler(createCookieHandler())
-
-	e := WithConfig(Config{
-		BaseURL:  "http://example.com",
-		Reporter: NewAssertReporter(t),
-		Client: &http.Client{
-			Transport: NewFastBinder(handler),
-			Jar:       nil,
-		},
-	})
-
-	testCookieHandler(e, false)
-}
-
-func TestE2ECookieBinderFastEnabled(t *testing.T) {
-	handler := fasthttpadaptor.NewFastHTTPHandler(createCookieHandler())
-
-	e := WithConfig(Config{
-		BaseURL:  "http://example.com",
-		Reporter: NewAssertReporter(t),
-		Client: &http.Client{
-			Transport: NewFastBinder(handler),
 			Jar:       NewJar(),
 		},
 	})

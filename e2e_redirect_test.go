@@ -4,8 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/valyala/fasthttp"
 )
 
 func createRedirectHandler() http.Handler {
@@ -20,18 +18,6 @@ func createRedirectHandler() http.Handler {
 	})
 
 	return mux
-}
-
-func createRedirectFastHandler() fasthttp.RequestHandler {
-	return func(ctx *fasthttp.RequestCtx) {
-		switch string(ctx.Path()) {
-		case "/foo":
-			ctx.SetBody([]byte(`hello`))
-
-		case "/bar":
-			ctx.Redirect("/foo", http.StatusFound)
-		}
-	}
 }
 
 func testRedirectHandler(e *Expect) {
@@ -57,18 +43,6 @@ func TestE2ERedirectBinderStandard(t *testing.T) {
 		Reporter: NewAssertReporter(t),
 		Client: &http.Client{
 			Transport: NewBinder(handler),
-		},
-	}))
-}
-
-func TestE2ERedirectBinderFast(t *testing.T) {
-	handler := createRedirectFastHandler()
-
-	testRedirectHandler(WithConfig(Config{
-		BaseURL:  "http://example.com",
-		Reporter: NewAssertReporter(t),
-		Client: &http.Client{
-			Transport: NewFastBinder(handler),
 		},
 	}))
 }

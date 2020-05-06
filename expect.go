@@ -3,8 +3,8 @@
 // Usage examples
 //
 // See example directory:
-//  - https://godoc.org/github.com/gavv/httpexpect/_examples
-//  - https://github.com/gavv/httpexpect/tree/master/_examples
+//  - https://godoc.org/github.com/iris-contrib/httpexpect/_examples
+//  - https://github.com/gavv/iris-contrib/tree/master/_examples
 //
 // Communication mode
 //
@@ -20,10 +20,6 @@
 // the following:
 //  1. default (nil) - use HTTP transport from net/http (you should start server)
 //  2. httpexpect.Binder - invoke given http.Handler directly
-//  3. httpexpect.FastBinder - invoke given fasthttp.RequestHandler directly
-//
-// Note that http handler can be usually obtained from http framework you're using.
-// E.g., echo framework provides either http.Handler or fasthttp.RequestHandler.
 //
 // You can also provide your own implementation of RequestFactory (creates http.Request),
 // or Client (gets http.Request and returns http.Response).
@@ -145,9 +141,6 @@ type RequestFactory interface {
 // Example:
 //  httpBinderClient := &http.Client{
 //    Transport: httpexpect.NewBinder(HTTPHandler),
-//  }
-//  fastBinderClient := &http.Client{
-//    Transport: httpexpect.NewFastBinder(FastHTTPHandler),
 //  }
 type Client interface {
 	// Do sends request and returns response.

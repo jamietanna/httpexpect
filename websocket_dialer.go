@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
-	"github.com/valyala/fasthttp"
 )
 
 // NewWebsocketDialer produces new websocket.Dialer which dials to bound
@@ -18,18 +17,6 @@ func NewWebsocketDialer(handler http.Handler) *websocket.Dialer {
 		NetDial: func(network, addr string) (net.Conn, error) {
 			hc := newHandlerConn()
 			hc.runHandler(handler)
-			return hc, nil
-		},
-	}
-}
-
-// NewFastWebsocketDialer produces new websocket.Dialer which dials to bound
-// fasthttp.RequestHandler without creating a real net.Conn.
-func NewFastWebsocketDialer(handler fasthttp.RequestHandler) *websocket.Dialer {
-	return &websocket.Dialer{
-		NetDial: func(network, addr string) (net.Conn, error) {
-			hc := newHandlerConn()
-			hc.runFastHandler(handler)
 			return hc, nil
 		},
 	}
@@ -72,16 +59,6 @@ func (hc *handlerConn) runHandler(handler http.Handler) {
 			}
 			handler.ServeHTTP(recorder, req)
 		}
-	}()
-}
-
-func (hc *handlerConn) runFastHandler(handler fasthttp.RequestHandler) {
-	hc.wg.Add(1)
-
-	go func() {
-		defer hc.wg.Done()
-
-		_ = fasthttp.ServeConn(hc.backConn, handler)
 	}()
 }
 

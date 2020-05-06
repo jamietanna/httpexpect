@@ -18,5 +18,5 @@ tidy:
 	mv _examples examples && ( \
 		cd examples ; \
 		go mod tidy -v ; \
-		go get -v -u=patch github.com/gavv/httpexpect ; \
+		go get -v -u=patch github.com/iris-contrib/httpexpect ; \
 			) && mv examples _examples

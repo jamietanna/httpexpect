@@ -1,14 +1,10 @@
 package httpexpect
 
 import (
-	"bufio"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/valyala/fasthttp"
 )
 
 func createChunkedHandler() http.Handler {
@@ -31,27 +27,6 @@ func createChunkedHandler() http.Handler {
 	})
 
 	return mux
-}
-
-func createChunkedFastHandler(t *testing.T) fasthttp.RequestHandler {
-	return func(ctx *fasthttp.RequestCtx) {
-		headers := map[string][]string{}
-
-		ctx.Request.Header.VisitAll(func(k, v []byte) {
-			headers[string(k)] = append(headers[string(k)], string(v))
-		})
-
-		assert.Equal(t, []string{"chunked"}, headers["Transfer-Encoding"])
-		assert.Equal(t, "value", string(ctx.FormValue("key")))
-		assert.Equal(t, "key=value", string(ctx.Request.Body()))
-
-		ctx.Response.Header.Set("Content-Type", "application/json")
-		ctx.Response.SetBodyStreamWriter(func(w *bufio.Writer) {
-			_, _ = w.WriteString(`[1, `)
-			_ = w.Flush()
-			_, _ = w.WriteString(`2]`)
-		})
-	}
 }
 
 func testChunkedHandler(e *Expect) {
@@ -82,18 +57,6 @@ func TestE2EChunkedBinderStandard(t *testing.T) {
 		Reporter: NewAssertReporter(t),
 		Client: &http.Client{
 			Transport: NewBinder(handler),
-		},
-	}))
-}
-
-func TestE2EChunkedBinderFast(t *testing.T) {
-	handler := createChunkedFastHandler(t)
-
-	testChunkedHandler(WithConfig(Config{
-		BaseURL:  "http://example.com",
-		Reporter: NewAssertReporter(t),
-		Client: &http.Client{
-			Transport: NewFastBinder(handler),
 		},
 	}))
 }

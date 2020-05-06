@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/valyala/fasthttp"
 )
 
 func createAutoTLSHandler(https string) http.Handler {
@@ -31,26 +30,6 @@ func createAutoTLSHandler(https string) http.Handler {
 	})
 
 	return mux
-}
-
-func createAutoTLSFastHandler(https string) fasthttp.RequestHandler {
-	return func(ctx *fasthttp.RequestCtx) {
-		switch string(ctx.Path()) {
-		case "/tls":
-			if !ctx.IsTLS() {
-				ctx.SetBody([]byte(`no`))
-			} else {
-				ctx.SetBody([]byte(`yes`))
-			}
-
-		case "/protected":
-			if !ctx.IsTLS() {
-				ctx.Redirect(https+string(ctx.Request.RequestURI()), http.StatusFound)
-			} else {
-				ctx.SetBody([]byte(`hello`))
-			}
-		}
-	}
 }
 
 func testAutoTLSHandler(config Config) {
@@ -111,26 +90,6 @@ func TestE2EAutoTLSBinderStandard(t *testing.T) {
 			},
 			Client: &http.Client{
 				Transport: &Binder{
-					Handler: handler,
-					TLS:     &tls.ConnectionState{},
-				},
-			},
-		})
-	}
-}
-
-func TestE2EAutoTLSBinderFast(t *testing.T) {
-	handler := createAutoTLSFastHandler("https://example.com")
-
-	for _, url := range []string{"https://example.com", "http://example.com"} {
-		testAutoTLSHandler(Config{
-			BaseURL:  url,
-			Reporter: NewRequireReporter(t),
-			Printers: []Printer{
-				NewDebugPrinter(t, true),
-			},
-			Client: &http.Client{
-				Transport: &FastBinder{
 					Handler: handler,
 					TLS:     &tls.ConnectionState{},
 				},

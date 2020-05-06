@@ -6,9 +6,7 @@ import (
 	"testing"
 	"time"
 
-	fastwebsocket "github.com/fasthttp-contrib/websocket"
 	"github.com/gorilla/websocket"
-	"github.com/valyala/fasthttp"
 )
 
 type wsHandlerOpts struct {
@@ -45,26 +43,6 @@ func createWebsocketHandler(opts wsHandlerOpts) http.Handler {
 	})
 
 	return mux
-}
-
-func websocketFastHandler(ctx *fasthttp.RequestCtx) {
-	upgrader := fastwebsocket.New(func(c *fastwebsocket.Conn) {
-		defer c.Close()
-		for {
-			mt, message, err := c.ReadMessage()
-			if err != nil {
-				break
-			}
-			err = c.WriteMessage(mt, message)
-			if err != nil {
-				break
-			}
-		}
-	})
-	err := upgrader.Upgrade(ctx)
-	if err != nil {
-		panic(err)
-	}
 }
 
 func testWebsocketSession(e *Expect) {
@@ -168,33 +146,6 @@ func TestE2EWebsocketHandlerStandard(t *testing.T) {
 
 		testWebsocket(e.Builder(func(req *Request) {
 			req.WithWebsocketDialer(NewWebsocketDialer(handler))
-		}))
-	})
-}
-
-func TestE2EWebsocketHandlerFast(t *testing.T) {
-	t.Run("dialer-config", func(t *testing.T) {
-		e := WithConfig(Config{
-			Reporter:        NewAssertReporter(t),
-			WebsocketDialer: NewFastWebsocketDialer(websocketFastHandler),
-			Printers: []Printer{
-				NewDebugPrinter(t, true),
-			},
-		})
-
-		testWebsocket(e)
-	})
-
-	t.Run("dialer-method", func(t *testing.T) {
-		e := WithConfig(Config{
-			Reporter: NewAssertReporter(t),
-			Printers: []Printer{
-				NewDebugPrinter(t, true),
-			},
-		})
-
-		testWebsocket(e.Builder(func(req *Request) {
-			req.WithWebsocketDialer(NewFastWebsocketDialer(websocketFastHandler))
 		}))
 	})
 }

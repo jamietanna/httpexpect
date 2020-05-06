@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gavv/httpexpect/v2"
+	"github.com/iris-contrib/httpexpect/v2"
 )
 
 func irisTester(t *testing.T) *httpexpect.Expect {
