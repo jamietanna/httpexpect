@@ -3,8 +3,8 @@
 // Usage examples
 //
 // See example directory:
-//  - https://godoc.org/github.com/iris-contrib/httpexpect/_examples
-//  - https://github.com/gavv/iris-contrib/tree/master/_examples
+//  - https://godoc.org/github.com/gavv/httpexpect/_examples
+//  - https://github.com/gavv/httpexpect/tree/master/_examples
 //
 // Communication mode
 //
@@ -20,6 +20,8 @@
 // the following:
 //  1. default (nil) - use HTTP transport from net/http (you should start server)
 //  2. httpexpect.Binder - invoke given http.Handler directly
+//
+// Note that http handler can be usually obtained from http framework you're using.
 //
 // You can also provide your own implementation of RequestFactory (creates http.Request),
 // or Client (gets http.Request and returns http.Response).
@@ -62,6 +64,7 @@
 package httpexpect
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -125,6 +128,14 @@ type Config struct {
 	// you're happy with their format, but want to send logs somewhere
 	// else instead of testing.TB.
 	Printers []Printer
+
+	// Context is passed to all requests. It is typically used for request cancellation,
+	// either explicit or after a time-out.
+	// May be nil.
+	//
+	// You can use the Request.WithContext for per-request context and Request.WithTimeout
+	// for per-request timeout.
+	Context context.Context
 }
 
 // RequestFactory is used to create all http.Request objects.
@@ -136,7 +147,7 @@ type RequestFactory interface {
 // Client is used to send http.Request and receive http.Response.
 // http.Client implements this interface.
 //
-// Binder and FastBinder may be used to obtain this interface implementation.
+// Binder may be used to obtain this interface implementation.
 //
 // Example:
 //  httpBinderClient := &http.Client{
@@ -151,7 +162,7 @@ type Client interface {
 // of handshake result.
 // websocket.Dialer implements this interface.
 //
-// NewWebsocketDialer and NewFastWebsocketDialer may be used to obtain this
+// NewWebsocketDialer may be used to obtain this
 // interface implementation.
 //
 // Example:
