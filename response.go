@@ -3,6 +3,8 @@ package httpexpect
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"mime"
 	"net/http"
@@ -15,6 +17,257 @@ import (
 	"github.com/ajg/form"
 	"github.com/gorilla/websocket"
 )
+
+// Response provides methods to inspect attached http.Response object.
+type Response struct {
+	noCopy noCopy
+	config Config
+	chain  *chain
+
+	httpResp  *http.Response
+	websocket *websocket.Conn
+	rtt       *time.Duration
+
+	content      []byte
+	contentState contentState
+
+	cookies []*http.Cookie
+}
+
+type contentState int
+
+const (
+	contentPending contentState = iota
+	contentRetreived
+	contentFailed
+)
+
+// NewResponse returns a new Response instance.
+//
+// If reporter is nil, the function panics.
+// If response is nil, failure is reported.
+//
+// If rtt is given, it defines response round-trip time to be reported
+// by response.RoundTripTime().
+func NewResponse(
+	reporter Reporter, response *http.Response, rtt ...time.Duration,
+) *Response {
+	config := Config{Reporter: reporter}
+	config = config.withDefaults()
+
+	return newResponse(responseOpts{
+		config:   config,
+		chain:    newChainWithConfig("Response()", config),
+		httpResp: response,
+		rtt:      rtt,
+	})
+}
+
+// NewResponse returns a new Response instance with config.
+//
+// Requirements for config are same as for WithConfig function.
+// If response is nil, failure is reported.
+//
+// If rtt is given, it defines response round-trip time to be reported
+// by response.RoundTripTime().
+func NewResponseC(
+	config Config, response *http.Response, rtt ...time.Duration,
+) *Response {
+	config = config.withDefaults()
+
+	return newResponse(responseOpts{
+		config:   config,
+		chain:    newChainWithConfig("Response()", config),
+		httpResp: response,
+		rtt:      rtt,
+	})
+}
+
+type responseOpts struct {
+	config    Config
+	chain     *chain
+	httpResp  *http.Response
+	websocket *websocket.Conn
+	rtt       []time.Duration
+}
+
+func newResponse(opts responseOpts) *Response {
+	opts.config.validate()
+
+	r := &Response{
+		config:       opts.config,
+		chain:        opts.chain.clone(),
+		contentState: contentPending,
+	}
+
+	opChain := r.chain.enter("")
+	defer opChain.leave()
+
+	if len(opts.rtt) > 1 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected multiple rtt arguments"),
+			},
+		})
+		return r
+	}
+
+	if len(opts.rtt) > 0 {
+		rttCopy := opts.rtt[0]
+		r.rtt = &rttCopy
+	}
+
+	if opts.httpResp == nil {
+		opChain.fail(AssertionFailure{
+			Type:   AssertNotNil,
+			Actual: &AssertionValue{opts.httpResp},
+			Errors: []error{
+				errors.New("expected: non-nil response"),
+			},
+		})
+		return r
+	}
+
+	r.httpResp = opts.httpResp
+
+	if r.httpResp.Body != nil && r.httpResp.Body != http.NoBody {
+		if _, ok := r.httpResp.Body.(*bodyWrapper); !ok {
+			respCopy := *r.httpResp
+			r.httpResp = &respCopy
+			r.httpResp.Body = newBodyWrapper(r.httpResp.Body, nil)
+		}
+	}
+
+	r.websocket = opts.websocket
+	r.cookies = r.httpResp.Cookies()
+
+	r.chain.setResponse(r)
+
+	return r
+}
+
+func (r *Response) getContent(opChain *chain) ([]byte, bool) {
+	switch r.contentState {
+	case contentRetreived:
+		return r.content, true
+
+	case contentFailed:
+		return nil, false
+
+	case contentPending:
+		break
+	}
+
+	resp := r.httpResp
+
+	if resp.Body == nil || resp.Body == http.NoBody {
+		return []byte{}, true
+	}
+
+	if bw, ok := resp.Body.(*bodyWrapper); ok {
+		bw.Rewind()
+	}
+
+	content, err := ioutil.ReadAll(resp.Body)
+
+	closeErr := resp.Body.Close()
+	if err == nil {
+		err = closeErr
+	}
+
+	if err != nil {
+		opChain.fail(AssertionFailure{
+			Type: AssertOperation,
+			Errors: []error{
+				errors.New("failed to read response body"),
+				err,
+			},
+		})
+
+		r.content = nil
+		r.contentState = contentFailed
+
+		return nil, false
+	}
+
+	r.content = content
+	r.contentState = contentRetreived
+
+	return r.content, true
+}
+
+// Raw returns underlying http.Response object.
+// This is the value originally passed to NewResponse.
+func (r *Response) Raw() *http.Response {
+	return r.httpResp
+}
+
+// Alias is similar to Value.Alias.
+func (r *Response) Alias(name string) *Response {
+	opChain := r.chain.enter("Alias(%q)", name)
+	defer opChain.leave()
+
+	r.chain.setAlias(name)
+	return r
+}
+
+// RoundTripTime returns a new Duration instance with response round-trip time.
+//
+// The returned duration is the time interval starting just before request is
+// sent and ending right after response is received (handshake finished for
+// WebSocket request), retrieved from a monotonic clock source.
+//
+// Example:
+//
+//	resp := NewResponse(t, response, time.Duration(10000000))
+//	resp.RoundTripTime().Lt(10 * time.Millisecond)
+func (r *Response) RoundTripTime() *Duration {
+	opChain := r.chain.enter("RoundTripTime()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newDuration(opChain, nil)
+	}
+
+	return newDuration(opChain, r.rtt)
+}
+
+// Deprecated: use RoundTripTime instead.
+func (r *Response) Duration() *Number {
+	opChain := r.chain.enter("Duration()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newNumber(opChain, 0)
+	}
+
+	if r.rtt == nil {
+		return newNumber(opChain, 0)
+	}
+
+	return newNumber(opChain, float64(*r.rtt))
+}
+
+// Status succeeds if response contains given status code.
+//
+// Example:
+//
+//	resp := NewResponse(t, response)
+//	resp.Status(http.StatusOK)
+func (r *Response) Status(status int) *Response {
+	opChain := r.chain.enter("Status()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return r
+	}
+
+	r.checkEqual(opChain, "http status",
+		statusCodeText(status), statusCodeText(r.httpResp.StatusCode))
+
+	return r
+}
 
 // StatusRange is enum for response status ranges.
 type StatusRange int
@@ -36,155 +289,91 @@ const (
 	Status5xx StatusRange = 500
 )
 
-// Response provides methods to inspect attached http.Response object.
-type Response struct {
-	config    Config
-	chain     chain
-	resp      *http.Response
-	content   []byte
-	cookies   []*http.Cookie
-	websocket *websocket.Conn
-	rtt       *time.Duration
-}
-
-// NewResponse returns a new Response given a reporter used to report
-// failures and http.Response to be inspected.
-//
-// Both reporter and response should not be nil. If response is nil,
-// failure is reported.
-//
-// If rtt is given, it defines response round-trip time to be reported
-// by response.RoundTripTime().
-func NewResponse(
-	reporter Reporter, response *http.Response, rtt ...time.Duration,
-) *Response {
-	var rttPtr *time.Duration
-	if len(rtt) > 0 {
-		rttPtr = &rtt[0]
-	}
-	return makeResponse(responseOpts{
-		chain:    makeChain(reporter),
-		response: response,
-		rtt:      rttPtr,
-	})
-}
-
-type responseOpts struct {
-	config    Config
-	chain     chain
-	response  *http.Response
-	websocket *websocket.Conn
-	rtt       *time.Duration
-}
-
-func makeResponse(opts responseOpts) *Response {
-	var content []byte
-	var cookies []*http.Cookie
-	if opts.response != nil {
-		content = getContent(&opts.chain, opts.response)
-		cookies = opts.response.Cookies()
-	} else {
-		opts.chain.fail("expected non-nil response")
-	}
-	return &Response{
-		config:    opts.config,
-		chain:     opts.chain,
-		resp:      opts.response,
-		content:   content,
-		cookies:   cookies,
-		websocket: opts.websocket,
-		rtt:       opts.rtt,
-	}
-}
-
-func getContent(chain *chain, resp *http.Response) []byte {
-	if resp.Body == nil {
-		return []byte{}
-	}
-
-	content, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		chain.fail(err.Error())
-		return nil
-	}
-
-	return content
-}
-
-// Raw returns underlying http.Response object.
-// This is the value originally passed to NewResponse.
-func (r *Response) Raw() *http.Response {
-	return r.resp
-}
-
-// RoundTripTime returns a new Duration object that may be used to inspect
-// the round-trip time.
-//
-// The returned duration is a time interval starting just before request is
-// sent and ending right after response is received (handshake finished for
-// WebSocket request), retrieved from a monotonic clock source.
-//
-// Example:
-//  resp := NewResponse(t, response, time.Duration(10000000))
-//  resp.RoundTripTime().Lt(10 * time.Millisecond)
-func (r *Response) RoundTripTime() *Duration {
-	return &Duration{r.chain, r.rtt}
-}
-
-// Deprecated: use RoundTripTime instead.
-func (r *Response) Duration() *Number {
-	if r.rtt == nil {
-		return &Number{r.chain, 0}
-	}
-	return &Number{r.chain, float64(*r.rtt)}
-}
-
-// Status succeeds if response contains given status code.
-//
-// Example:
-//  resp := NewResponse(t, response)
-//  resp.Status(http.StatusOK)
-func (r *Response) Status(status int) *Response {
-	if r.chain.failed() {
-		return r
-	}
-	r.checkEqual("status", statusCodeText(status), statusCodeText(r.resp.StatusCode))
-	return r
-}
-
 // StatusRange succeeds if response status belongs to given range.
 //
 // Supported ranges:
-//  - Status1xx - Informational
-//  - Status2xx - Success
-//  - Status3xx - Redirection
-//  - Status4xx - Client Error
-//  - Status5xx - Server Error
+//   - Status1xx - Informational
+//   - Status2xx - Success
+//   - Status3xx - Redirection
+//   - Status4xx - Client Error
+//   - Status5xx - Server Error
 //
 // See https://en.wikipedia.org/wiki/List_of_HTTP_status_codes.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.StatusRange(Status2xx)
+//
+//	resp := NewResponse(t, response)
+//	resp.StatusRange(Status2xx)
 func (r *Response) StatusRange(rn StatusRange) *Response {
-	if r.chain.failed() {
+	opChain := r.chain.enter("StatusRange()")
+	defer opChain.leave()
+
+	if opChain.failed() {
 		return r
 	}
 
-	status := statusCodeText(r.resp.StatusCode)
+	status := statusCodeText(r.httpResp.StatusCode)
 
-	actual := statusRangeText(r.resp.StatusCode)
+	actual := statusRangeText(r.httpResp.StatusCode)
 	expected := statusRangeText(int(rn))
 
 	if actual == "" || actual != expected {
-		if actual == "" {
-			r.chain.fail("\nexpected status from range:\n %q\n\nbut got:\n %q",
-				expected, status)
-		} else {
-			r.chain.fail(
-				"\nexpected status from range:\n %q\n\nbut got:\n %q (%q)",
-				expected, actual, status)
+		opChain.fail(AssertionFailure{
+			Type:   AssertBelongs,
+			Actual: &AssertionValue{status},
+			Expected: &AssertionValue{AssertionList{
+				statusRangeText(int(rn)),
+			}},
+			Errors: []error{
+				errors.New("expected: http status belongs to given range"),
+			},
+		})
+	}
+
+	return r
+}
+
+// StatusList succeeds if response matches with any given status code list
+//
+// Example:
+//
+//	resp := NewResponse(t, response)
+//	resp.StatusList(http.StatusForbidden, http.StatusUnauthorized)
+func (r *Response) StatusList(values ...int) *Response {
+	opChain := r.chain.enter("StatusList()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return r
+	}
+
+	if len(values) == 0 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected empty status list"),
+			},
+		})
+		return r
+	}
+
+	var found bool
+	for _, v := range values {
+		if v == r.httpResp.StatusCode {
+			found = true
+			break
 		}
+	}
+
+	if !found {
+		opChain.fail(AssertionFailure{
+			Type:     AssertBelongs,
+			Actual:   &AssertionValue{statusCodeText(r.httpResp.StatusCode)},
+			Expected: &AssertionValue{AssertionList(statusListText(values))},
+			Errors: []error{
+				errors.New("expected: http status belongs to given list"),
+			},
+		})
 	}
 
 	return r
@@ -214,34 +403,55 @@ func statusRangeText(code int) string {
 	}
 }
 
-// Headers returns a new Object that may be used to inspect header map.
+func statusListText(values []int) []interface{} {
+	var statusText []interface{}
+	for _, v := range values {
+		statusText = append(statusText, statusCodeText(v))
+	}
+	return statusText
+}
+
+// Headers returns a new Object instance with response header map.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Headers().Value("Content-Type").String().Equal("application-json")
+//
+//	resp := NewResponse(t, response)
+//	resp.Headers().Value("Content-Type").String().IsEqual("application-json")
 func (r *Response) Headers() *Object {
-	var value map[string]interface{}
-	if !r.chain.failed() {
-		value, _ = canonMap(&r.chain, r.resp.Header)
+	opChain := r.chain.enter("Headers()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newObject(opChain, nil)
 	}
-	return &Object{r.chain, value}
+
+	var value map[string]interface{}
+	value, _ = canonMap(opChain, r.httpResp.Header)
+
+	return newObject(opChain, value)
 }
 
-// Header returns a new String object that may be used to inspect given header.
+// Header returns a new String instance with given header field.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Header("Content-Type").Equal("application-json")
-//  resp.Header("Date").DateTime().Le(time.Now())
+//
+//	resp := NewResponse(t, response)
+//	resp.Header("Content-Type").IsEqual("application-json")
+//	resp.Header("Date").AsDateTime().Le(time.Now())
 func (r *Response) Header(header string) *String {
-	value := ""
-	if !r.chain.failed() {
-		value = r.resp.Header.Get(header)
+	opChain := r.chain.enter("Header(%q)", header)
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newString(opChain, "")
 	}
-	return &String{r.chain, value}
+
+	value := r.httpResp.Header.Get(header)
+
+	return newString(opChain, value)
 }
 
-// Cookies returns a new Array object with all cookie names set by this response.
+// Cookies returns a new Array instance with all cookie names set by this response.
 // Returned Array contains a String value for every cookie name.
 //
 // Note that this returns only cookies set by Set-Cookie headers of this response.
@@ -249,84 +459,147 @@ func (r *Response) Header(header string) *String {
 // in a cookie jar.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Cookies().Contains("session")
+//
+//	resp := NewResponse(t, response)
+//	resp.Cookies().Contains("session")
 func (r *Response) Cookies() *Array {
-	if r.chain.failed() {
-		return &Array{r.chain, nil}
+	opChain := r.chain.enter("Cookies()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newArray(opChain, nil)
 	}
+
 	names := []interface{}{}
 	for _, c := range r.cookies {
 		names = append(names, c.Name)
 	}
-	return &Array{r.chain, names}
+
+	return newArray(opChain, names)
 }
 
-// Cookie returns a new Cookie object that may be used to inspect given cookie
-// set by this response.
+// Cookie returns a new Cookie instance with specified cookie from response.
 //
 // Note that this returns only cookies set by Set-Cookie headers of this response.
 // It doesn't return session cookies from previous responses, which may be stored
 // in a cookie jar.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Cookie("session").Domain().Equal("example.com")
+//
+//	resp := NewResponse(t, response)
+//	resp.Cookie("session").Domain().IsEqual("example.com")
 func (r *Response) Cookie(name string) *Cookie {
-	if r.chain.failed() {
-		return &Cookie{r.chain, nil}
+	opChain := r.chain.enter("Cookie(%q)", name)
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newCookie(opChain, nil)
 	}
+
+	var cookie *Cookie
+
 	names := []string{}
 	for _, c := range r.cookies {
 		if c.Name == name {
-			return &Cookie{r.chain, c}
+			cookie = newCookie(opChain, c)
+			break
 		}
 		names = append(names, c.Name)
 	}
-	r.chain.fail("\nexpected response with cookie:\n %q\n\nbut got only cookies:\n%s",
-		name, dumpValue(names))
-	return &Cookie{r.chain, nil}
+
+	if cookie == nil {
+		opChain.fail(AssertionFailure{
+			Type:     AssertContainsElement,
+			Actual:   &AssertionValue{names},
+			Expected: &AssertionValue{name},
+			Errors: []error{
+				errors.New("expected: response contains cookie with given name"),
+			},
+		})
+		return newCookie(opChain, nil)
+	}
+
+	return cookie
 }
 
-// Websocket returns Websocket object that can be used to interact with
-// WebSocket server.
+// Websocket returns Websocket instance for interaction with WebSocket server.
 //
 // May be called only if the WithWebsocketUpgrade was called on the request.
-// That is responsibility of the caller to explicitly close the websocket after use.
+// That is responsibility of the caller to explicitly disconnect websocket after use.
 //
 // Example:
-//  req := NewRequest(config, "GET", "/path")
-//  req.WithWebsocketUpgrade()
-//  ws := req.Expect().Websocket()
-//  defer ws.Disconnect()
+//
+//	req := NewRequestC(config, "GET", "/path")
+//	req.WithWebsocketUpgrade()
+//	ws := req.Expect().Websocket()
+//	defer ws.Disconnect()
 func (r *Response) Websocket() *Websocket {
-	if !r.chain.failed() && r.websocket == nil {
-		r.chain.fail("\nunexpected Websocket call for non-WebSocket response")
+	opChain := r.chain.enter("Websocket()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newWebsocket(opChain, r.config, nil)
 	}
-	return makeWebsocket(r.config, r.chain, r.websocket)
+
+	if r.websocket == nil {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New(
+					"Websocket() requires WithWebsocketUpgrade() to be called on request"),
+			},
+		})
+		return newWebsocket(opChain, r.config, nil)
+	}
+
+	return newWebsocket(opChain, r.config, r.websocket)
 }
 
-// Body returns a new String object that may be used to inspect response body.
+// Body returns a new String instance with response body.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Body().NotEmpty()
-//  resp.Body().Length().Equal(100)
+//
+//	resp := NewResponse(t, response)
+//	resp.Body().NotEmpty()
+//	resp.Body().Length().IsEqual(100)
 func (r *Response) Body() *String {
-	return &String{r.chain, string(r.content)}
+	opChain := r.chain.enter("Body()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newString(opChain, "")
+	}
+
+	content, ok := r.getContent(opChain)
+	if !ok {
+		return newString(opChain, "")
+	}
+
+	return newString(opChain, string(content))
 }
 
 // NoContent succeeds if response contains empty Content-Type header and
 // empty body.
 func (r *Response) NoContent() *Response {
-	if r.chain.failed() {
+	opChain := r.chain.enter("NoContent()")
+	defer opChain.leave()
+
+	if opChain.failed() {
 		return r
 	}
 
-	contentType := r.resp.Header.Get("Content-Type")
+	contentType := r.httpResp.Header.Get("Content-Type")
+	if !r.checkEqual(opChain, `"Content-Type" header`, "", contentType) {
+		return r
+	}
 
-	r.checkEqual("\"Content-Type\" header", "", contentType)
-	r.checkEqual("body", "", string(r.content))
+	content, ok := r.getContent(opChain)
+	if !ok {
+		return r
+	}
+	if !r.checkEqual(opChain, "body", "", string(content)) {
+		return r
+	}
 
 	return r
 }
@@ -340,27 +613,59 @@ func (r *Response) NoContent() *Response {
 // If charset is omitted, and mediaType is also empty, Content-Type header
 // should contain no charset.
 func (r *Response) ContentType(mediaType string, charset ...string) *Response {
-	r.checkContentType(mediaType, charset...)
+	opChain := r.chain.enter("ContentType()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return r
+	}
+
+	if len(charset) > 1 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected multiple charset arguments"),
+			},
+		})
+		return r
+	}
+
+	r.checkContentType(opChain, mediaType, charset...)
+
 	return r
 }
 
 // ContentEncoding succeeds if response has exactly given Content-Encoding list.
 // Common values are empty, "gzip", "compress", "deflate", "identity" and "br".
 func (r *Response) ContentEncoding(encoding ...string) *Response {
-	if r.chain.failed() {
+	opChain := r.chain.enter("ContentEncoding()")
+	defer opChain.leave()
+
+	if opChain.failed() {
 		return r
 	}
-	r.checkEqual("\"Content-Encoding\" header", encoding, r.resp.Header["Content-Encoding"])
+
+	r.checkEqual(opChain, `"Content-Encoding" header`,
+		encoding,
+		r.httpResp.Header["Content-Encoding"])
+
 	return r
 }
 
 // TransferEncoding succeeds if response contains given Transfer-Encoding list.
 // Common values are empty, "chunked" and "identity".
 func (r *Response) TransferEncoding(encoding ...string) *Response {
-	if r.chain.failed() {
+	opChain := r.chain.enter("TransferEncoding()")
+	defer opChain.leave()
+
+	if opChain.failed() {
 		return r
 	}
-	r.checkEqual("\"Transfer-Encoding\" header", encoding, r.resp.TransferEncoding)
+
+	r.checkEqual(opChain, `"Transfer-Encoding" header`,
+		encoding,
+		r.httpResp.TransferEncoding)
+
 	return r
 }
 
@@ -372,173 +677,293 @@ type ContentOpts struct {
 	Charset string
 }
 
-// Text returns a new String object that may be used to inspect response body.
+// Text returns a new String instance with response body.
 //
 // Text succeeds if response contains "text/plain" Content-Type header
 // with empty or "utf-8" charset.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Text().Equal("hello, world!")
-//  resp.Text(ContentOpts{
-//    MediaType: "text/plain",
-//  }).Equal("hello, world!")
-func (r *Response) Text(opts ...ContentOpts) *String {
-	var content string
+//
+//	resp := NewResponse(t, response)
+//	resp.Text().IsEqual("hello, world!")
+//	resp.Text(ContentOpts{
+//	  MediaType: "text/plain",
+//	}).IsEqual("hello, world!")
+func (r *Response) Text(options ...ContentOpts) *String {
+	opChain := r.chain.enter("Text()")
+	defer opChain.leave()
 
-	if !r.chain.failed() && r.checkContentOpts(opts, "text/plain") {
-		content = string(r.content)
+	if opChain.failed() {
+		return newString(opChain, "")
 	}
 
-	return &String{r.chain, content}
+	if len(options) > 1 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected multiple options arguments"),
+			},
+		})
+		return newString(opChain, "")
+	}
+
+	if !r.checkContentOptions(opChain, options, "text/plain") {
+		return newString(opChain, "")
+	}
+
+	content, ok := r.getContent(opChain)
+	if !ok {
+		return newString(opChain, "")
+	}
+
+	return newString(opChain, string(content))
 }
 
-// Form returns a new Object that may be used to inspect form contents
-// of response.
+// Form returns a new Object instance with form decoded from response body.
 //
 // Form succeeds if response contains "application/x-www-form-urlencoded"
 // Content-Type header and if form may be decoded from response body.
 // Decoding is performed using https://github.com/ajg/form.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.Form().Value("foo").Equal("bar")
-//  resp.Form(ContentOpts{
-//    MediaType: "application/x-www-form-urlencoded",
-//  }).Value("foo").Equal("bar")
-func (r *Response) Form(opts ...ContentOpts) *Object {
-	object := r.getForm(opts...)
-	return &Object{r.chain, object}
+//
+//	resp := NewResponse(t, response)
+//	resp.Form().Value("foo").IsEqual("bar")
+//	resp.Form(ContentOpts{
+//	  MediaType: "application/x-www-form-urlencoded",
+//	}).Value("foo").IsEqual("bar")
+func (r *Response) Form(options ...ContentOpts) *Object {
+	opChain := r.chain.enter("Form()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newObject(opChain, nil)
+	}
+
+	if len(options) > 1 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected multiple options arguments"),
+			},
+		})
+		return newObject(opChain, nil)
+	}
+
+	object := r.getForm(opChain, options...)
+
+	return newObject(opChain, object)
 }
 
-func (r *Response) getForm(opts ...ContentOpts) map[string]interface{} {
-	if r.chain.failed() {
+func (r *Response) getForm(
+	opChain *chain, options ...ContentOpts,
+) map[string]interface{} {
+	if !r.checkContentOptions(opChain, options, "application/x-www-form-urlencoded", "") {
 		return nil
 	}
 
-	if !r.checkContentOpts(opts, "application/x-www-form-urlencoded", "") {
+	content, ok := r.getContent(opChain)
+	if !ok {
 		return nil
 	}
 
-	decoder := form.NewDecoder(bytes.NewReader(r.content))
+	decoder := form.NewDecoder(bytes.NewReader(content))
 
 	var object map[string]interface{}
+
 	if err := decoder.Decode(&object); err != nil {
-		r.chain.fail(err.Error())
+		opChain.fail(AssertionFailure{
+			Type: AssertValid,
+			Actual: &AssertionValue{
+				string(content),
+			},
+			Errors: []error{
+				errors.New("failed to decode form"),
+				err,
+			},
+		})
 		return nil
 	}
 
 	return object
 }
 
-// JSON returns a new Value object that may be used to inspect JSON contents
-// of response.
+// JSON returns a new Value instance with JSON decoded from response body.
 //
 // JSON succeeds if response contains "application/json" Content-Type header
 // with empty or "utf-8" charset and if JSON may be decoded from response body.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.JSON().Array().Elements("foo", "bar")
-//  resp.JSON(ContentOpts{
-//    MediaType: "application/json",
-//  }).Array.Elements("foo", "bar")
-func (r *Response) JSON(opts ...ContentOpts) *Value {
-	value := r.getJSON(opts...)
-	return &Value{r.chain, value}
+//
+//	resp := NewResponse(t, response)
+//	resp.JSON().Array().ConsistsOf("foo", "bar")
+//	resp.JSON(ContentOpts{
+//	  MediaType: "application/json",
+//	}).Array.ConsistsOf("foo", "bar")
+func (r *Response) JSON(options ...ContentOpts) *Value {
+	opChain := r.chain.enter("JSON()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newValue(opChain, nil)
+	}
+
+	if len(options) > 1 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected multiple options arguments"),
+			},
+		})
+		return newValue(opChain, nil)
+	}
+
+	value := r.getJSON(opChain, options...)
+
+	return newValue(opChain, value)
 }
 
-func (r *Response) getJSON(opts ...ContentOpts) interface{} {
-	if r.chain.failed() {
+func (r *Response) getJSON(opChain *chain, options ...ContentOpts) interface{} {
+	if !r.checkContentOptions(opChain, options, "application/json") {
 		return nil
 	}
 
-	if !r.checkContentOpts(opts, "application/json") {
+	content, ok := r.getContent(opChain)
+	if !ok {
 		return nil
 	}
 
 	var value interface{}
-	if err := json.Unmarshal(r.content, &value); err != nil {
-		r.chain.fail(err.Error())
+
+	if err := json.Unmarshal(content, &value); err != nil {
+		opChain.fail(AssertionFailure{
+			Type: AssertValid,
+			Actual: &AssertionValue{
+				string(content),
+			},
+			Errors: []error{
+				errors.New("failed to decode json"),
+				err,
+			},
+		})
 		return nil
 	}
 
 	return value
 }
 
-// JSONP returns a new Value object that may be used to inspect JSONP contents
-// of response.
+// JSONP returns a new Value instance with JSONP decoded from response body.
 //
 // JSONP succeeds if response contains "application/javascript" Content-Type
 // header with empty or "utf-8" charset and response body of the following form:
-//  callback(<valid json>);
+//
+//	callback(<valid json>);
+//
 // or:
-//  callback(<valid json>)
+//
+//	callback(<valid json>)
 //
 // Whitespaces are allowed.
 //
 // Example:
-//  resp := NewResponse(t, response)
-//  resp.JSONP("myCallback").Array().Elements("foo", "bar")
-//  resp.JSONP("myCallback", ContentOpts{
-//    MediaType: "application/javascript",
-//  }).Array.Elements("foo", "bar")
-func (r *Response) JSONP(callback string, opts ...ContentOpts) *Value {
-	value := r.getJSONP(callback, opts...)
-	return &Value{r.chain, value}
+//
+//	resp := NewResponse(t, response)
+//	resp.JSONP("myCallback").Array().ConsistsOf("foo", "bar")
+//	resp.JSONP("myCallback", ContentOpts{
+//	  MediaType: "application/javascript",
+//	}).Array.ConsistsOf("foo", "bar")
+func (r *Response) JSONP(callback string, options ...ContentOpts) *Value {
+	opChain := r.chain.enter("JSONP()")
+	defer opChain.leave()
+
+	if opChain.failed() {
+		return newValue(opChain, nil)
+	}
+
+	if len(options) > 1 {
+		opChain.fail(AssertionFailure{
+			Type: AssertUsage,
+			Errors: []error{
+				errors.New("unexpected multiple options arguments"),
+			},
+		})
+		return newValue(opChain, nil)
+	}
+
+	value := r.getJSONP(opChain, callback, options...)
+
+	return newValue(opChain, value)
 }
 
 var (
 	jsonp = regexp.MustCompile(`^\s*([^\s(]+)\s*\((.*)\)\s*;*\s*$`)
 )
 
-func (r *Response) getJSONP(callback string, opts ...ContentOpts) interface{} {
-	if r.chain.failed() {
+func (r *Response) getJSONP(
+	opChain *chain, callback string, options ...ContentOpts,
+) interface{} {
+	if !r.checkContentOptions(opChain, options, "application/javascript") {
 		return nil
 	}
 
-	if !r.checkContentOpts(opts, "application/javascript") {
+	content, ok := r.getContent(opChain)
+	if !ok {
 		return nil
 	}
 
-	m := jsonp.FindSubmatch(r.content)
+	m := jsonp.FindSubmatch(content)
+
 	if len(m) != 3 || string(m[1]) != callback {
-		r.chain.fail(
-			"\nexpected JSONP body in form of:\n \"%s(<valid json>)\"\n\nbut got:\n %q\n",
-			callback,
-			string(r.content))
+		opChain.fail(AssertionFailure{
+			Type: AssertValid,
+			Actual: &AssertionValue{
+				string(content),
+			},
+			Errors: []error{
+				fmt.Errorf(`expected: JSONP body in form of "%s(<valid json>)"`,
+					callback),
+			},
+		})
 		return nil
 	}
 
 	var value interface{}
+
 	if err := json.Unmarshal(m[2], &value); err != nil {
-		r.chain.fail(err.Error())
+		opChain.fail(AssertionFailure{
+			Type: AssertValid,
+			Actual: &AssertionValue{
+				string(content),
+			},
+			Errors: []error{
+				errors.New("failed to decode json"),
+				err,
+			},
+		})
 		return nil
 	}
 
 	return value
 }
 
-func (r *Response) checkContentOpts(
-	opts []ContentOpts, expectedType string, expectedCharset ...string,
+func (r *Response) checkContentOptions(
+	opChain *chain, options []ContentOpts, expectedType string, expectedCharset ...string,
 ) bool {
-	if len(opts) != 0 {
-		if opts[0].MediaType != "" {
-			expectedType = opts[0].MediaType
+	if len(options) != 0 {
+		if options[0].MediaType != "" {
+			expectedType = options[0].MediaType
 		}
-		if opts[0].Charset != "" {
-			expectedCharset = []string{opts[0].Charset}
+		if options[0].Charset != "" {
+			expectedCharset = []string{options[0].Charset}
 		}
 	}
-	return r.checkContentType(expectedType, expectedCharset...)
+	return r.checkContentType(opChain, expectedType, expectedCharset...)
 }
 
-func (r *Response) checkContentType(expectedType string, expectedCharset ...string) bool {
-	if r.chain.failed() {
-		return false
-	}
-
-	contentType := r.resp.Header.Get("Content-Type")
+func (r *Response) checkContentType(
+	opChain *chain, expectedType string, expectedCharset ...string,
+) bool {
+	contentType := r.httpResp.Header.Get("Content-Type")
 
 	if expectedType == "" && len(expectedCharset) == 0 {
 		if contentType == "" {
@@ -548,14 +973,26 @@ func (r *Response) checkContentType(expectedType string, expectedCharset ...stri
 
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
-		r.chain.fail("\ngot invalid \"Content-Type\" header %q", contentType)
+		opChain.fail(AssertionFailure{
+			Type:   AssertValid,
+			Actual: &AssertionValue{contentType},
+			Errors: []error{
+				errors.New(`invalid "Content-Type" response header`),
+				err,
+			},
+		})
 		return false
 	}
 
 	if mediaType != expectedType {
-		r.chain.fail(
-			"\nexpected \"Content-Type\" header with %q media type,"+
-				"\nbut got %q", expectedType, mediaType)
+		opChain.fail(AssertionFailure{
+			Type:     AssertEqual,
+			Actual:   &AssertionValue{mediaType},
+			Expected: &AssertionValue{expectedType},
+			Errors: []error{
+				errors.New(`unexpected media type in "Content-Type" response header`),
+			},
+		})
 		return false
 	}
 
@@ -563,16 +1000,26 @@ func (r *Response) checkContentType(expectedType string, expectedCharset ...stri
 
 	if len(expectedCharset) == 0 {
 		if charset != "" && !strings.EqualFold(charset, "utf-8") {
-			r.chain.fail(
-				"\nexpected \"Content-Type\" header with \"utf-8\" or empty charset,"+
-					"\nbut got %q", charset)
+			opChain.fail(AssertionFailure{
+				Type:     AssertBelongs,
+				Actual:   &AssertionValue{charset},
+				Expected: &AssertionValue{AssertionList{"", "utf-8"}},
+				Errors: []error{
+					errors.New(`unexpected charset in "Content-Type" response header`),
+				},
+			})
 			return false
 		}
 	} else {
 		if !strings.EqualFold(charset, expectedCharset[0]) {
-			r.chain.fail(
-				"\nexpected \"Content-Type\" header with %q charset,"+
-					"\nbut got %q", expectedCharset[0], charset)
+			opChain.fail(AssertionFailure{
+				Type:     AssertEqual,
+				Actual:   &AssertionValue{charset},
+				Expected: &AssertionValue{expectedCharset[0]},
+				Errors: []error{
+					errors.New(`unexpected charset in "Content-Type" response header`),
+				},
+			})
 			return false
 		}
 	}
@@ -580,9 +1027,20 @@ func (r *Response) checkContentType(expectedType string, expectedCharset ...stri
 	return true
 }
 
-func (r *Response) checkEqual(what string, expected, actual interface{}) {
+func (r *Response) checkEqual(
+	opChain *chain, what string, expected, actual interface{},
+) bool {
 	if !reflect.DeepEqual(expected, actual) {
-		r.chain.fail("\nexpected %s equal to:\n%s\n\nbut got:\n%s", what,
-			dumpValue(expected), dumpValue(actual))
+		opChain.fail(AssertionFailure{
+			Type:     AssertEqual,
+			Actual:   &AssertionValue{actual},
+			Expected: &AssertionValue{expected},
+			Errors: []error{
+				fmt.Errorf("unexpected %s value", what),
+			},
+		})
+		return false
 	}
+
+	return true
 }

@@ -1,10 +1,10 @@
 package httpexpect
 
 import (
-	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
 )
@@ -25,9 +25,10 @@ type Binder struct {
 // NewBinder returns a new Binder given a http.Handler.
 //
 // Example:
-//   client := &http.Client{
-//       Transport: NewBinder(handler),
-//   }
+//
+//	client := &http.Client{
+//	    Transport: NewBinder(handler),
+//	}
 func NewBinder(handler http.Handler) Binder {
 	return Binder{Handler: handler}
 }
@@ -40,12 +41,12 @@ func (binder Binder) RoundTrip(origReq *http.Request) (*http.Response, error) {
 		req.Proto = fmt.Sprintf("HTTP/%d.%d", req.ProtoMajor, req.ProtoMinor)
 	}
 
-	if req.Body != nil {
+	if req.Body != nil && req.Body != http.NoBody {
 		if req.ContentLength == -1 {
 			req.TransferEncoding = []string{"chunked"}
 		}
 	} else {
-		req.Body = ioutil.NopCloser(bytes.NewReader(nil))
+		req.Body = http.NoBody
 	}
 
 	if req.URL != nil && req.URL.Scheme == "https" && binder.TLS != nil {
@@ -76,4 +77,29 @@ func (binder Binder) RoundTrip(origReq *http.Request) (*http.Response, error) {
 	}
 
 	return &resp, nil
+}
+
+type connNonTLS struct {
+	net.Conn
+}
+
+func (connNonTLS) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4zero}
+}
+
+func (connNonTLS) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4zero}
+}
+
+type connTLS struct {
+	connNonTLS
+	state *tls.ConnectionState
+}
+
+func (c connTLS) Handshake() error {
+	return nil
+}
+
+func (c connTLS) ConnectionState() tls.ConnectionState {
+	return *c.state
 }
