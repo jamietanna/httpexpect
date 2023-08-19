@@ -134,6 +134,10 @@ type AssertionContext struct {
 	// Environment shared between tests
 	// Comes from Expect instance
 	Environment *Environment
+
+	// Whether reporter is known to output to testing.TB
+	// For example, true when reporter is testing.T or testify-based reporter.
+	TestingTB bool
 }
 
 // AssertionFailure provides detailed information about failed assertion.
@@ -188,6 +192,9 @@ type AssertionFailure struct {
 
 	// Allowed delta between actual and expected
 	Delta *AssertionValue
+
+	// Stacktrace of the failure
+	Stacktrace []StacktraceEntry
 }
 
 // AssertionValue holds expected or actual value

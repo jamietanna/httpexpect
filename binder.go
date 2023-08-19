@@ -27,7 +27,7 @@ type Binder struct {
 // Example:
 //
 //	client := &http.Client{
-//	    Transport: NewBinder(handler),
+//		Transport: NewBinder(handler),
 //	}
 func NewBinder(handler http.Handler) Binder {
 	return Binder{Handler: handler}

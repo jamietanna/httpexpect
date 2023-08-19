@@ -3,12 +3,21 @@ package httpexpect
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
+	"net/http/httputil"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"testing"
 	"text/template"
 
+	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 	"github.com/mitchellh/go-wordwrap"
 	"github.com/sanity-io/litter"
 	"github.com/yudai/gojsondiff"
@@ -45,9 +54,27 @@ type DefaultFormatter struct {
 	// Exclude diff from failure report.
 	DisableDiffs bool
 
+	// Exclude HTTP request from failure report.
+	DisableRequests bool
+
+	// Exclude HTTP response from failure report.
+	DisableResponses bool
+
+	// Thousand separator.
+	// Default is DigitSeparatorUnderscore.
+	DigitSeparator DigitSeparator
+
 	// Float printing format.
 	// Default is FloatFormatAuto.
 	FloatFormat FloatFormat
+
+	// Defines whether to print stacktrace on failure and in what format.
+	// Default is StacktraceModeDisabled.
+	StacktraceMode StacktraceMode
+
+	// Colorization mode.
+	// Default is ColorModeAuto.
+	ColorMode ColorMode
 
 	// Wrap text to keep lines below given width.
 	// Use zero for default width, and negative value to disable wrapping.
@@ -91,6 +118,23 @@ func (f *DefaultFormatter) FormatFailure(
 	}
 }
 
+// DigitSeparator defines the separator used to format integers and floats.
+type DigitSeparator int
+
+const (
+	// Separate using underscore
+	DigitSeparatorUnderscore DigitSeparator = iota
+
+	// Separate using comma
+	DigitSeparatorComma
+
+	// Separate using apostrophe
+	DigitSeparatorApostrophe
+
+	// Do not separate
+	DigitSeparatorNone
+)
+
 // FloatFormat defines the format in which all floats are printed.
 type FloatFormat int
 
@@ -110,6 +154,43 @@ const (
 	// Precision is the smallest needed to identify the value uniquely.
 	// Similar to %e format.
 	FloatFormatScientific
+)
+
+// StacktraceMode defines the format of stacktrace.
+type StacktraceMode int
+
+const (
+	// Don't print stacktrace.
+	StacktraceModeDisabled StacktraceMode = iota
+
+	// Standard, verbose format.
+	StacktraceModeStandard
+
+	// Compact format.
+	StacktraceModeCompact
+)
+
+// ColorMode defines how the text color is enabled.
+type ColorMode int
+
+const (
+	// Automatically enable colors if ALL of the following is true:
+	//  - stdout is a tty / console
+	//  - AssertionHandler is known to output to testing.T
+	//  - testing.Verbose() is true
+	//
+	// Colors are forcibly enabled if FORCE_COLOR environment variable
+	// is set to a positive integer.
+	//
+	// Colors are forcibly disabled if TERM is "dumb" or NO_COLOR
+	// environment variable is set to non-empty string.
+	ColorModeAuto ColorMode = iota
+
+	// Unconditionally enable colors.
+	ColorModeAlways
+
+	// Unconditionally disable colors.
+	ColorModeNever
 )
 
 // FormatData defines data passed to template engine when DefaultFormatter
@@ -142,7 +223,17 @@ type FormatData struct {
 	HaveDiff bool
 	Diff     string
 
-	LineWidth int
+	HaveRequest bool
+	Request     string
+
+	HaveResponse bool
+	Response     string
+
+	HaveStacktrace bool
+	Stacktrace     []string
+
+	EnableColors bool
+	LineWidth    int
 }
 
 const (
@@ -188,7 +279,7 @@ func (f *DefaultFormatter) buildFormatData(
 ) *FormatData {
 	data := FormatData{}
 
-	f.fillDescription(&data, ctx)
+	f.fillGeneral(&data, ctx)
 
 	if failure != nil {
 		data.AssertType = failure.Type.String()
@@ -213,12 +304,16 @@ func (f *DefaultFormatter) buildFormatData(
 		if failure.Delta != nil {
 			f.fillDelta(&data, ctx, failure)
 		}
+
+		f.fillRequest(&data, ctx, failure)
+		f.fillResponse(&data, ctx, failure)
+		f.fillStacktrace(&data, ctx, failure)
 	}
 
 	return &data
 }
 
-func (f *DefaultFormatter) fillDescription(
+func (f *DefaultFormatter) fillGeneral(
 	data *FormatData, ctx *AssertionContext,
 ) {
 	if !f.DisableNames {
@@ -234,6 +329,22 @@ func (f *DefaultFormatter) fillDescription(
 		}
 	}
 
+	switch f.ColorMode {
+	case ColorModeAuto:
+		switch colorMode() {
+		case colorsUnsupported:
+			data.EnableColors = false
+		case colorsForced:
+			data.EnableColors = true
+		case colorsSupported:
+			data.EnableColors = ctx.TestingTB && flag.Parsed() && testing.Verbose()
+		}
+	case ColorModeAlways:
+		data.EnableColors = true
+	case ColorModeNever:
+		data.EnableColors = false
+	}
+
 	if f.LineWidth != 0 {
 		data.LineWidth = f.LineWidth
 	} else {
@@ -244,6 +355,8 @@ func (f *DefaultFormatter) fillDescription(
 func (f *DefaultFormatter) fillErrors(
 	data *FormatData, ctx *AssertionContext, failure *AssertionFailure,
 ) {
+	data.Errors = []string{}
+
 	for _, err := range failure.Errors {
 		if refIsNil(err) {
 			continue
@@ -426,13 +539,80 @@ func (f *DefaultFormatter) fillDelta(
 	data.Delta = f.formatValue(failure.Delta.Value)
 }
 
+func (f *DefaultFormatter) fillRequest(
+	data *FormatData, ctx *AssertionContext, failure *AssertionFailure,
+) {
+	if !f.DisableRequests && ctx.Request != nil && ctx.Request.httpReq != nil {
+		dump, err := httputil.DumpRequest(ctx.Request.httpReq, false)
+		if err != nil {
+			return
+		}
+
+		data.HaveRequest = true
+		data.Request = string(dump)
+	}
+}
+
+func (f *DefaultFormatter) fillResponse(
+	data *FormatData, ctx *AssertionContext, failure *AssertionFailure,
+) {
+	if !f.DisableResponses && ctx.Response != nil && ctx.Response.httpResp != nil {
+		dump, err := httputil.DumpResponse(ctx.Response.httpResp, false)
+		if err != nil {
+			return
+		}
+
+		text := strings.Replace(string(dump), "\r\n", "\n", -1)
+		lines := strings.SplitN(text, "\n", 2)
+
+		data.HaveResponse = true
+		data.Response = fmt.Sprintf("%s %s\n%s", lines[0], ctx.Response.rtt, lines[1])
+	}
+}
+
+func (f *DefaultFormatter) fillStacktrace(
+	data *FormatData, ctx *AssertionContext, failure *AssertionFailure,
+) {
+	data.Stacktrace = []string{}
+
+	switch f.StacktraceMode {
+	case StacktraceModeDisabled:
+		break
+
+	case StacktraceModeStandard:
+		for _, entry := range failure.Stacktrace {
+			data.HaveStacktrace = true
+			data.Stacktrace = append(data.Stacktrace,
+				fmt.Sprintf("%s()\n\t%s:%d +0x%x",
+					entry.Func.Name(), entry.File, entry.Line, entry.FuncOffset))
+
+		}
+
+	case StacktraceModeCompact:
+		for _, entry := range failure.Stacktrace {
+			if entry.IsEntrypoint {
+				break
+			}
+			data.HaveStacktrace = true
+			data.Stacktrace = append(data.Stacktrace,
+				fmt.Sprintf("%s() at %s:%d (%s)",
+					entry.FuncName, filepath.Base(entry.File), entry.Line, entry.FuncPackage))
+
+		}
+	}
+}
+
 func (f *DefaultFormatter) formatValue(value interface{}) string {
 	if flt := extractFloat32(value); flt != nil {
-		return f.formatFloatValue(*flt, 32)
+		return f.reformatNumber(f.formatFloatValue(*flt, 32))
 	}
 
 	if flt := extractFloat64(value); flt != nil {
-		return f.formatFloatValue(*flt, 64)
+		return f.reformatNumber(f.formatFloatValue(*flt, 64))
+	}
+
+	if refIsNum(value) {
+		return f.reformatNumber(fmt.Sprintf("%v", value))
 	}
 
 	if !refIsNil(value) && !refIsHTTP(value) {
@@ -561,6 +741,91 @@ func (f *DefaultFormatter) formatDiff(expected, actual interface{}) (string, boo
 	return diffText, true
 }
 
+func (f *DefaultFormatter) reformatNumber(numStr string) string {
+	signPart, intPart, fracPart, expPart := f.decomposeNumber(numStr)
+	if intPart == "" {
+		return numStr
+	}
+
+	var sb strings.Builder
+
+	sb.WriteString(signPart)
+	sb.WriteString(f.applySeparator(intPart, -1))
+
+	if fracPart != "" {
+		sb.WriteString(".")
+		sb.WriteString(f.applySeparator(fracPart, +1))
+	}
+
+	if expPart != "" {
+		sb.WriteString("e")
+		sb.WriteString(expPart)
+	}
+
+	return sb.String()
+}
+
+var (
+	decomposeRegexp = regexp.MustCompile(`^([+-])?(\d+)([.](\d+))?([eE]([+-]?\d+))?$`)
+)
+
+func (f *DefaultFormatter) decomposeNumber(numStr string) (
+	signPart, intPart, fracPart, expPart string,
+) {
+	parts := decomposeRegexp.FindStringSubmatch(numStr)
+
+	if len(parts) > 1 {
+		signPart = parts[1]
+	}
+	if len(parts) > 2 {
+		intPart = parts[2]
+	}
+	if len(parts) > 4 {
+		fracPart = parts[4]
+	}
+	if len(parts) > 6 {
+		expPart = parts[6]
+	}
+
+	return
+}
+
+func (f *DefaultFormatter) applySeparator(numStr string, dir int) string {
+	var separator string
+	switch f.DigitSeparator {
+	case DigitSeparatorUnderscore:
+		separator = "_"
+		break
+	case DigitSeparatorApostrophe:
+		separator = "'"
+		break
+	case DigitSeparatorComma:
+		separator = ","
+		break
+	case DigitSeparatorNone:
+	default:
+		return numStr
+	}
+
+	var sb strings.Builder
+
+	cnt := 0
+	if dir < 0 {
+		cnt = len(numStr)
+	}
+
+	for i := 0; i != len(numStr); i++ {
+		sb.WriteByte(numStr[i])
+
+		cnt += dir
+		if cnt%3 == 0 && i != len(numStr)-1 {
+			sb.WriteString(separator)
+		}
+	}
+
+	return sb.String()
+}
+
 func extractString(value interface{}) *string {
 	switch s := value.(type) {
 	case string:
@@ -611,16 +876,72 @@ func extractList(value interface{}) *AssertionList {
 	}
 }
 
+var (
+	colorsSupportedOnce sync.Once
+	colorsSupportedMode int
+)
+
+const (
+	colorsUnsupported = iota
+	colorsSupported
+	colorsForced
+)
+
+func colorMode() int {
+	colorsSupportedOnce.Do(func() {
+		if s := os.Getenv("FORCE_COLOR"); len(s) != 0 {
+			if n, err := strconv.Atoi(s); err == nil && n > 0 {
+				colorsSupportedMode = colorsForced
+				return
+			}
+		}
+
+		if (isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())) &&
+			len(os.Getenv("NO_COLOR")) == 0 &&
+			!strings.HasPrefix(os.Getenv("TERM"), "dumb") {
+			colorsSupportedMode = colorsSupported
+			return
+		}
+
+		colorsSupportedMode = colorsUnsupported
+		return
+	})
+
+	return colorsSupportedMode
+}
+
 const (
 	defaultIndent    = "  "
 	defaultLineWidth = 60
 )
 
+var defaultColors = map[string]color.Attribute{
+	// regular
+	"Black":   color.FgBlack,
+	"Red":     color.FgRed,
+	"Green":   color.FgGreen,
+	"Yellow":  color.FgYellow,
+	"Magenta": color.FgMagenta,
+	"Cyan":    color.FgCyan,
+	"White":   color.FgWhite,
+	// bright
+	"HiBlack":   color.FgHiBlack,
+	"HiRed":     color.FgHiRed,
+	"HiGreen":   color.FgHiGreen,
+	"HiYellow":  color.FgHiYellow,
+	"HiMagenta": color.FgHiMagenta,
+	"HiCyan":    color.FgHiCyan,
+	"HiWhite":   color.FgHiWhite,
+}
+
 var defaultTemplateFuncs = template.FuncMap{
-	"indent": func(s string) string {
+	"trim": func(input string) string {
+		return strings.TrimSpace(input)
+	},
+	"indent": func(input string) string {
 		var sb strings.Builder
 
-		for _, s := range strings.Split(s, "\n") {
+		for _, s := range strings.Split(input, "\n") {
 			if sb.Len() != 0 {
 				sb.WriteString("\n")
 			}
@@ -630,17 +951,20 @@ var defaultTemplateFuncs = template.FuncMap{
 
 		return sb.String()
 	},
-	"wrap": func(s string, width int) string {
-		s = strings.TrimSpace(s)
-		if width < 0 {
-			return s
+	"wrap": func(width int, input string) string {
+		input = strings.TrimSpace(input)
+
+		width -= len(defaultIndent)
+		if width <= 0 {
+			return input
 		}
 
-		return wordwrap.WrapString(s, uint(width))
+		return wordwrap.WrapString(input, uint(width))
 	},
-	"join": func(strs []string, width int) string {
-		if width < 0 {
-			return strings.Join(strs, ".")
+	"join": func(width int, tokenList []string) string {
+		width -= len(defaultIndent)
+		if width <= 0 {
+			return strings.Join(tokenList, ".")
 		}
 
 		var sb strings.Builder
@@ -653,49 +977,112 @@ var defaultTemplateFuncs = template.FuncMap{
 			lineLen += len(s)
 		}
 
-		for n, s := range strs {
-			if lineLen > width {
+		for n, token := range tokenList {
+			if lineLen+len(token)+1 > width {
 				write("\n")
 				lineLen = 0
-				lineNum++
+				if lineNum < 2 {
+					lineNum++
+				}
 			}
 			if lineLen == 0 {
 				for l := 0; l < lineNum; l++ {
 					write(defaultIndent)
 				}
 			}
-			write(s)
-			if n != len(strs)-1 {
+			write(token)
+			if n != len(tokenList)-1 {
 				write(".")
 			}
 		}
 
 		return sb.String()
 	},
+	"color": func(enable bool, colorName, input string) string {
+		if !enable {
+			return input
+		}
+		colorAttr := color.Reset
+		if ca, ok := defaultColors[colorName]; ok {
+			colorAttr = ca
+		}
+		return color.New(colorAttr).Sprint(input)
+	},
+	"colordiff": func(enable bool, input string) string {
+		if !enable {
+			return input
+		}
+
+		prefixColor := []struct {
+			prefix string
+			color  color.Attribute
+		}{
+			{"---", color.FgWhite},
+			{"+++", color.FgWhite},
+			{"-", color.FgRed},
+			{"+", color.FgGreen},
+		}
+
+		lineColor := func(s string) color.Attribute {
+			for _, pc := range prefixColor {
+				if strings.HasPrefix(s, pc.prefix) {
+					return pc.color
+				}
+			}
+
+			return color.Reset
+		}
+
+		var sb strings.Builder
+		for _, line := range strings.Split(input, "\n") {
+			if sb.Len() != 0 {
+				sb.WriteString("\n")
+			}
+
+			sb.WriteString(color.New(lineColor(line)).Sprint(line))
+		}
+
+		return sb.String()
+	},
 }
 
-var defaultSuccessTemplate = `[OK] {{ join .AssertPath .LineWidth }}`
+var defaultSuccessTemplate = `[OK] {{ join .LineWidth .AssertPath }}`
 
 var defaultFailureTemplate = `
 {{- range $n, $err := .Errors }}
 {{ if eq $n 0 -}}
-{{ wrap $err $.LineWidth }}
+{{ $err | wrap $.LineWidth | color $.EnableColors "Red" }}
 {{- else -}}
-{{ wrap $err $.LineWidth | indent }}
+{{ $err | wrap $.LineWidth | indent | color $.EnableColors "Red" }}
 {{- end -}}
 {{- end -}}
 {{- if .TestName }}
 
-test name: {{ .TestName }}
+test name: {{ .TestName | color $.EnableColors "Cyan" }}
 {{- end -}}
 {{- if .RequestName }}
 
-request name: {{ .RequestName }}
+request name: {{ .RequestName | color $.EnableColors "Cyan" }}
+{{- end -}}
+{{- if .HaveRequest }}
+
+request: {{ .Request | indent | trim | color $.EnableColors "HiMagenta" }}
+{{- end -}}
+{{- if .HaveResponse }}
+
+response: {{ .Response | indent | trim | color $.EnableColors "HiMagenta" }}
+{{- end -}}
+{{- if .HaveStacktrace }}
+
+trace:
+{{- range $n, $call := .Stacktrace }}
+{{ $call | indent }}
+{{- end -}}
 {{- end -}}
 {{- if .AssertPath }}
 
 assertion:
-{{ join .AssertPath .LineWidth | indent }}
+{{ join .LineWidth .AssertPath | indent | color .EnableColors "Yellow" }}
 {{- end -}}
 {{- if .HaveExpected }}
 
@@ -704,27 +1091,27 @@ assertion:
 {{- else }}expected
 {{- end }} {{ .ExpectedKind }}:
 {{- range $n, $exp := .Expected }}
-{{ $exp | indent }}
+{{ $exp | indent | color $.EnableColors "HiMagenta" }}
 {{- end -}}
 {{- end -}}
 {{- if .HaveActual }}
 
 actual value:
-{{ .Actual | indent }}
+{{ .Actual | indent | color .EnableColors "HiMagenta" }}
 {{- end -}}
 {{- if .HaveReference }}
 
 reference value:
-{{ .Reference | indent }}
+{{ .Reference | indent | color .EnableColors "HiMagenta" }}
 {{- end -}}
 {{- if .HaveDelta }}
 
 allowed delta:
-{{ .Delta | indent }}
+{{ .Delta | indent | color .EnableColors "HiMagenta" }}
 {{- end -}}
 {{- if .HaveDiff }}
 
 diff:
-{{ .Diff | indent }}
+{{ .Diff | colordiff .EnableColors | indent }}
 {{- end -}}
 `
